@@ -42,10 +42,16 @@ class Meta:
 
         if protocol == "s3" and "ETag" in info:
             etag = info["ETag"].strip('"')
-        elif protocol == "gs" and "etag" in info:
+        elif protocol == "gs" and "md5Hash" in info:
+            # In case of Google Cloud, ETag not only contains the data information, but also has metadata encoded into
+            # it, which includes file path. It can also vary, depending on the API, used to obtain it. See docs for
+            # (a bit) more details: https://cloud.google.com/storage/docs/hashes-etags#etags
+            #
+            # Thus using it to reason about the file contents is not correct, so we have to use the alternative
+            # file-contents-only attribute
             import base64
 
-            etag = base64.b64decode(info["etag"]).hex()
+            etag = base64.b64decode(info["md5Hash"]).hex()
         elif (
             protocol
             and protocol.startswith("http")
