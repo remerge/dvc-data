@@ -7,8 +7,7 @@ from .hash_info import HashInfo
 from .tree import Tree
 
 if TYPE_CHECKING:
-    from dvc_objects.db import ObjectDB
-
+    from .db import HashFileDB
     from .db.index import ObjectDBIndexBase
     from .obj import HashFile
 
@@ -82,14 +81,13 @@ def _indexed_dir_hashes(odb, index, dir_objs, name, cache_odb, jobs=None):
 
 
 def status(
-    odb: "ObjectDB",
+    odb: "HashFileDB",
     obj_ids: Iterable["HashInfo"],
     name: Optional[str] = None,
     index: Optional["ObjectDBIndexBase"] = None,
-    cache_odb: Optional["ObjectDB"] = None,
+    cache_odb: Optional["HashFileDB"] = None,
     shallow: bool = True,
     jobs: Optional[int] = None,
-    **kwargs,
 ) -> "StatusResult":
     """Return status of whether or not the specified objects exist odb.
 
@@ -157,12 +155,13 @@ def status(
 
 
 def compare_status(
-    src: "ObjectDB",
-    dest: "ObjectDB",
+    src: "HashFileDB",
+    dest: "HashFileDB",
     obj_ids: Iterable["HashInfo"],
     check_deleted: bool = True,
     src_index: Optional["ObjectDBIndexBase"] = None,
     dest_index: Optional["ObjectDBIndexBase"] = None,
+    cache_odb: Optional["HashFileDB"] = None,
     jobs: Optional[int] = None,
     **kwargs,
 ) -> "CompareStatusResult":
@@ -174,10 +173,15 @@ def compare_status(
         new: hashes that only exist in src
         deleted: hashes that only exist in dest
     """
-    if "cache_odb" not in kwargs:
-        kwargs["cache_odb"] = src
+    if cache_odb is None:
+        cache_odb = src
     dest_exists, dest_missing = status(
-        dest, obj_ids, index=dest_index, jobs=jobs, **kwargs
+        dest,
+        obj_ids,
+        index=dest_index,
+        jobs=jobs,
+        cache_odb=cache_odb,
+        **kwargs,
     )
     # for transfer operations we can skip src status check when all objects
     # already exist in dest

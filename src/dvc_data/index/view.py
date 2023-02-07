@@ -1,8 +1,19 @@
 from collections import deque
-from typing import Any, Callable, Iterator, Optional, Tuple, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterator,
+    Optional,
+    Tuple,
+    cast,
+)
 
 from ..hashfile.tree import Tree
 from .index import BaseDataIndex, DataIndex, DataIndexEntry, DataIndexKey
+
+if TYPE_CHECKING:
+    from .index import StorageMapping
 
 
 class DataIndexView(BaseDataIndex):
@@ -13,6 +24,10 @@ class DataIndexView(BaseDataIndex):
     ):
         self._index = index
         self.filter_fn = filter_fn
+
+    @property
+    def storage_map(self) -> "StorageMapping":  # type: ignore[override]
+        return self._index.storage_map
 
     def __getitem__(self, key: DataIndexKey) -> DataIndexEntry:
         if self.filter_fn(key):
@@ -28,7 +43,7 @@ class DataIndexView(BaseDataIndex):
     def _iteritems(
         self,
         prefix: Optional[DataIndexKey] = None,
-        shallow: bool = False,
+        shallow: Optional[bool] = False,
         ensure_loaded: bool = False,
     ) -> Iterator[Tuple[DataIndexKey, DataIndexEntry]]:
         # NOTE: iteration is implemented using traverse and not iter/iteritems
@@ -70,7 +85,7 @@ class DataIndexView(BaseDataIndex):
         self,
         prefix: DataIndexKey,
         entry: Optional[DataIndexEntry],
-        shallow: bool = False,
+        shallow: Optional[bool] = False,
     ) -> Iterator[DataIndexKey]:
         # NOTE: traverse() will not enter subtries that have been added
         # in-place during traversal. So for dirs which we load in-place, we
@@ -89,7 +104,9 @@ class DataIndexView(BaseDataIndex):
                     yield prefix + key
 
     def iteritems(
-        self, prefix: Optional[DataIndexKey] = None, shallow: bool = False
+        self,
+        prefix: Optional[DataIndexKey] = None,
+        shallow: Optional[bool] = False,
     ) -> Iterator[Tuple[DataIndexKey, DataIndexEntry]]:
         return self._iteritems(
             prefix=prefix, shallow=shallow, ensure_loaded=True
@@ -99,8 +116,28 @@ class DataIndexView(BaseDataIndex):
         def _node_factory(path_conv, key, children, *args):
             if not key or self.filter_fn(key):
                 return node_factory(path_conv, key, children, *args)
+            return None
 
         return self._index.traverse(_node_factory, **kwargs)
+
+    def ls(self, root_key: DataIndexKey, detail=True):
+        def node_factory(_, key, children, entry=None):
+            if key == root_key:
+                return children
+
+            if detail:
+                return key, self._info_from_entry(key, entry)
+
+            return key
+
+        self._index._ensure_loaded(  # pylint: disable=protected-access
+            root_key
+        )
+        yield from (
+            entry
+            for entry in self.traverse(node_factory, prefix=root_key)
+            if entry is not None
+        )
 
     def has_node(self, key: DataIndexKey) -> bool:
         return self.filter_fn(key) and self._index.has_node(key)

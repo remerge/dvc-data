@@ -1,7 +1,7 @@
-from functools import partial, wraps
+from collections import defaultdict
+from functools import wraps
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
-from dvc_objects.executors import ThreadPoolExecutor
 from dvc_objects.fs.callbacks import DEFAULT_CALLBACK
 
 from ..hashfile.hash_info import HashInfo
@@ -9,46 +9,55 @@ from ..hashfile.meta import Meta
 from ..hashfile.tree import Tree
 
 if TYPE_CHECKING:
+    from dvc_objects.fs.base import FileSystem
     from dvc_objects.fs.callbacks import Callback
 
     from ..hashfile.db import HashFileDB
-    from .index import BaseDataIndex, DataIndexEntry, DataIndexKey
+    from ..hashfile.state import StateBase
+    from .index import BaseDataIndex, DataIndexKey
 
 
-def md5(index: "BaseDataIndex") -> None:
+def md5(index: "BaseDataIndex", state: Optional["StateBase"] = None) -> None:
     from ..hashfile.hash import fobj_md5
 
     for _, entry in index.iteritems():
-        assert entry.fs
         if entry.meta and entry.meta.isdir:
             continue
 
         if entry.hash_info and entry.hash_info.name == "md5":
             continue
 
-        if entry.meta and entry.meta.version_id and entry.fs.version_aware:
+        storage = index.storage_map[entry.key]
+        fs = storage.fs
+        path = storage.path
+        assert fs
+        if entry.meta and entry.meta.version_id and fs.version_aware:
             # NOTE: if we have versioning available - there is no need to check
             # metadata as we can directly get correct file content using
             # version_id.
-            path = entry.fs.path.version_path(
-                entry.path, entry.meta.version_id
-            )
-        else:
-            path = entry.path
+            path = fs.path.version_path(path, entry.meta.version_id)
 
         try:
-            meta = Meta.from_info(entry.fs.info(path), entry.fs.protocol)
+            meta = Meta.from_info(fs.info(path), fs.protocol)
         except FileNotFoundError:
             continue
 
         if entry.meta != meta:
             continue
 
-        with entry.fs.open(path, "rb") as fobj:
+        if state:
+            _, entry.hash_info = state.get(path, fs)
+            if entry.hash_info:
+                continue
+
+        with fs.open(path, "rb") as fobj:
             entry.hash_info = HashInfo(
                 "md5",
                 fobj_md5(fobj),
             )
+
+        if state:
+            state.save(path, fs, entry.hash_info)
 
 
 def build_tree(
@@ -78,7 +87,7 @@ def _save_dir_entry(
     from ..hashfile.db import add_update_tree
 
     entry = index[key]
-    cache = odb or entry.cache
+    cache = odb or index.storage_map[key].odb
     assert cache
     meta, tree = build_tree(index, key)
     tree = add_update_tree(cache, tree)
@@ -101,6 +110,11 @@ def _wrap_add(callback: "Callback", fn: Callable):
     return func
 
 
+if TYPE_CHECKING:
+    _ODBMap = Dict["HashFileDB", "_FSMap"]
+    _FSMap = Dict["FileSystem", List[Tuple[str, str]]]
+
+
 def save(
     index: "BaseDataIndex",
     odb: Optional["HashFileDB"] = None,
@@ -111,59 +125,41 @@ def save(
     dir_entries: List["DataIndexKey"] = []
     transferred = 0
 
-    processor = partial(
-        _save_one,
-        dir_entries,
-        odb=odb,
-        callback=callback,
-        **kwargs,
-    )
-    if not jobs and odb is not None:
-        jobs = odb.fs.jobs
-    with ThreadPoolExecutor(max_workers=jobs) as executor:
-        transferred = sum(
-            executor.imap_unordered(processor, index.iteritems())
-        )
+    odb_map: "_ODBMap" = {}
+    for key, entry in index.iteritems():
+        if entry.meta and entry.meta.isdir:
+            dir_entries.append(key)
+            continue
+        storage = index.storage_map[entry.key]
+        fs = storage.fs
+        path = storage.path
+        assert fs
+        if entry.meta and entry.meta.version_id and fs.version_aware:
+            # NOTE: if we have versioning available - there is no need to check
+            # metadata as we can directly get correct file content using
+            # version_id.
+            path = fs.path.version_path(path, entry.meta.version_id)
+        if entry.hash_info:
+            cache = odb or index.storage_map[key].odb
+            assert cache
+            assert entry.hash_info.value
+            oid = entry.hash_info.value
+            if cache not in odb_map:
+                odb_map[cache] = defaultdict(list)
+            odb_map[cache][fs].append((path, oid))
+    for cache, fs_map in odb_map.items():
+        for fs, args in fs_map.items():
+            paths, oids = zip(*args)
+            transferred += cache.add(
+                list(paths),
+                fs,
+                list(oids),
+                callback=callback,
+                batch_size=jobs,
+                **kwargs,
+            )
 
     for key in dir_entries:
         _save_dir_entry(index, key, odb=odb)
 
     return transferred
-
-
-def _save_one(
-    dir_entries: List["DataIndexKey"],
-    item: Tuple["DataIndexKey", "DataIndexEntry"],
-    odb: Optional["HashFileDB"] = None,
-    callback: "Callback" = DEFAULT_CALLBACK,
-    **kwargs,
-) -> int:
-    key, entry = item
-    assert entry.meta
-    if entry.meta.isdir:
-        dir_entries.append(key)
-        return 0
-
-    assert entry.fs
-    if entry.meta.version_id and entry.fs.version_aware:
-        # NOTE: if we have versioning available - there is no need to check
-        # metadata as we can directly get correct file content using
-        # version_id.
-        path = entry.fs.path.version_path(entry.path, entry.meta.version_id)
-    else:
-        path = entry.path
-
-    if entry.hash_info:
-        cache = odb or entry.cache
-        assert entry.hash_info.value
-        assert cache
-        add = _wrap_add(callback, cache.add)
-        return add(
-            path,
-            entry.fs,
-            entry.hash_info.value,
-            callback=callback,
-            **kwargs,
-        )
-
-    return 0

@@ -1,11 +1,14 @@
+from collections import deque
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 
 from attrs import define
 
 if TYPE_CHECKING:
     from .hashfile.meta import Meta
+    from .hashfile.hash_info import HashInfo
     from .index import BaseDataIndex, DataIndexKey
 
+from ..hashfile.tree import TreeError
 from .index import DataIndexEntry
 
 ADD = "add"
@@ -13,6 +16,7 @@ MODIFY = "modify"
 RENAME = "rename"
 DELETE = "delete"
 UNCHANGED = "unchanged"
+UNKNOWN = "unknown"
 
 
 @define(frozen=True, hash=True, order=True)
@@ -28,8 +32,10 @@ class Change:
 
         if self.typ == ADD:
             entry = self.new
-        else:
+        elif self.typ == DELETE:
             entry = self.old
+        else:
+            entry = self.old or self.new
 
         assert entry
         assert entry.key
@@ -39,48 +45,171 @@ class Change:
         return self.typ != UNCHANGED
 
 
+def _diff_meta(
+    old: Optional["Meta"],
+    new: Optional["Meta"],
+    *,
+    cmp_key: Optional[Callable[["Meta"], Any]] = None,
+):
+    if old is None and new is not None:
+        return ADD
+
+    if old is not None and new is None:
+        return DELETE
+
+    if cmp_key is None and old != new:
+        return MODIFY
+
+    if cmp_key is not None and cmp_key(old) != cmp_key(new):
+        return MODIFY
+
+    return UNCHANGED
+
+
+def _diff_hash_info(
+    old: Optional["HashInfo"],
+    new: Optional["HashInfo"],
+):
+    if not old and new:
+        return ADD
+
+    if old and not new:
+        return DELETE
+
+    if old and new and old != new:
+        return MODIFY
+
+    return UNCHANGED
+
+
+def _diff_entry(
+    old: Optional["DataIndexEntry"],
+    new: Optional["DataIndexEntry"],
+    *,
+    hash_only: Optional[bool] = False,
+    meta_only: Optional[bool] = False,
+    meta_cmp_key: Optional[Callable[["Meta"], Any]] = None,
+    unknown: Optional[bool] = False,
+):
+    if unknown:
+        return UNKNOWN
+
+    old_hi = old.hash_info if old else None
+    new_hi = new.hash_info if new else None
+    old_meta = old.meta if old else None
+    new_meta = new.meta if new else None
+
+    meta_diff = _diff_meta(old_meta, new_meta, cmp_key=meta_cmp_key)
+    hi_diff = _diff_hash_info(old_hi, new_hi)
+
+    if meta_only:
+        return meta_diff
+
+    if hash_only:
+        return hi_diff
+
+    # If both meta's are None, return hi_diff
+    if meta_diff == UNCHANGED and old_meta is None:
+        return hi_diff
+
+    # If both hi's are falsey, return meta_diff
+    if hi_diff == UNCHANGED and not old_hi:
+        return meta_diff
+
+    # Only return UNCHANGED/ADD/DELETE when hi_diff and meta_diff match,
+    # otherwise return MODIFY
+    if meta_diff == hi_diff:
+        return meta_diff
+
+    return MODIFY
+
+
+def _get_items(
+    index: Optional["BaseDataIndex"],
+    key,
+    entry,
+    *,
+    shallow=False,
+    with_unknown=False,
+):
+    items = {}
+    unknown = False
+
+    try:
+        if index is not None and not (shallow and entry):
+            items = dict(index.ls(key, detail=True))
+    except KeyError:
+        pass
+    except TreeError:
+        unknown = with_unknown
+
+    return items, unknown
+
+
 def _diff(
     old: Optional["BaseDataIndex"],
     new: Optional["BaseDataIndex"],
     *,
     with_unchanged: Optional[bool] = False,
+    with_unknown: Optional[bool] = False,
     hash_only: Optional[bool] = False,
     meta_only: Optional[bool] = False,
     meta_cmp_key: Optional[Callable[["Meta"], Any]] = None,
+    shallow: Optional[bool] = False,
 ):
-    old_keys = {key for key, _ in old.iteritems()} if old else set()
-    new_keys = {key for key, _ in new.iteritems()} if new else set()
+    todo = deque([((), None, None, False)])
+    while todo:
+        dirkey, old_direntry, new_direntry, unknown = todo.popleft()
 
-    for key in old_keys | new_keys:
-        old_entry = old.get(key) if old is not None else None
-        new_entry = new.get(key) if new is not None else None
-        old_hi = old_entry.hash_info if old_entry else None
-        new_hi = new_entry.hash_info if new_entry else None
-        old_meta = old_entry.meta if old_entry else None
-        new_meta = new_entry.meta if new_entry else None
+        kwargs = {"shallow": shallow, "with_unknown": with_unknown}
+        old_items, old_unknown = _get_items(
+            old, dirkey, old_direntry, **kwargs
+        )
+        new_items, new_unknown = _get_items(
+            new, dirkey, new_direntry, **kwargs
+        )
+        unknown = old_unknown or new_unknown
 
-        typ = UNCHANGED
-        if old_entry and not new_entry:
-            typ = DELETE
-        elif not old_entry and new_entry:
-            typ = ADD
-        elif not meta_only and (old_hi and new_hi):
-            if old_hi != new_hi:
-                typ = MODIFY
-        elif not hash_only:
+        for key in old_items.keys() | new_items.keys():
+            old_info = old_items.get(key) or {}
+            new_info = new_items.get(key) or {}
+
+            old_entry = old_info.get("entry")
+            new_entry = new_info.get("entry")
+
+            typ = _diff_entry(
+                old_entry,
+                new_entry,
+                hash_only=hash_only,
+                meta_only=meta_only,
+                meta_cmp_key=meta_cmp_key,
+                unknown=unknown,
+            )
+
             if (
-                meta_cmp_key is None or old_meta is None or new_meta is None
-            ) and old_meta != new_meta:
-                typ = MODIFY
-            elif meta_cmp_key is not None and meta_cmp_key(
-                old_meta
-            ) != meta_cmp_key(new_meta):
-                typ = MODIFY
+                hash_only
+                and not with_unchanged
+                and not unknown
+                and typ == UNCHANGED
+                and old_entry
+                and old_entry.hash_info
+                and old_entry.hash_info.isdir
+            ):
+                # NOTE: skipping the whole branch since we know it is unchanged
+                pass
+            elif (
+                old_info.get("type") == "directory"
+                or new_info.get("type") == "directory"
+            ):
+                todo.append((key, old_entry, new_entry, unknown))
 
-        if typ == UNCHANGED and not with_unchanged:
-            continue
+            if old_entry is None and new_entry is None:
+                continue
 
-        yield Change(typ, old_entry, new_entry)
+            if typ == UNCHANGED and not with_unchanged:
+                continue
+
+            yield Change(typ, old_entry, new_entry)
 
 
 def _detect_renames(changes: Iterable[Change]):
@@ -135,17 +264,21 @@ def diff(
     *,
     with_renames: Optional[bool] = False,
     with_unchanged: Optional[bool] = False,
+    with_unknown: Optional[bool] = False,
     hash_only: Optional[bool] = False,
     meta_only: Optional[bool] = False,
     meta_cmp_key: Optional[Callable[["Meta"], Any]] = None,
+    shallow: Optional[bool] = False,
 ):
     changes = _diff(
         old,
         new,
         with_unchanged=with_unchanged,
+        with_unknown=with_unknown,
         hash_only=hash_only,
         meta_only=meta_only,
         meta_cmp_key=meta_cmp_key,
+        shallow=shallow,
     )
 
     if with_renames and old is not None and new is not None:

@@ -1,25 +1,29 @@
 import errno
 import logging
-from functools import partial, wraps
+from collections import defaultdict
 from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Dict,
     Iterable,
+    List,
     NamedTuple,
     Optional,
     Set,
+    Tuple,
 )
 
-from dvc_objects._tqdm import Tqdm
-from dvc_objects.executors import ThreadPoolExecutor
+from dvc_objects.fs.callbacks import Callback
 from funcy import split
 
-if TYPE_CHECKING:
-    from dvc_objects.db import ObjectDB
+from .hash_info import HashInfo
 
+if TYPE_CHECKING:
+    from dvc_objects.fs.base import FileSystem
+
+    from .db import HashFileDB
     from .db.index import ObjectDBIndexBase
-    from .hash_info import HashInfo
     from .status import CompareStatusResult
     from .tree import Tree
 
@@ -31,28 +35,17 @@ class TransferResult(NamedTuple):
     failed: Set["HashInfo"]
 
 
-def _log_exceptions(
-    func: Callable[["HashInfo"], None]
-) -> Callable[["HashInfo"], Optional["HashInfo"]]:
-    @wraps(func)
-    def wrapper(oid: "HashInfo") -> Optional["HashInfo"]:
-        try:
-            func(oid)
-            return None
-        except Exception as exc:  # pylint: disable=broad-except
-            # NOTE: this means we ran out of file descriptors and there is no
-            # reason to try to proceed, as we will hit this error anyways.
-            # pylint: disable=no-member
-            if isinstance(exc, OSError) and exc.errno == errno.EMFILE:
-                raise
-            logger.exception("failed to transfer '%s'", oid)
-            return oid
-
-    return wrapper
+def _log_exception(oid: str, exc: BaseException):
+    # NOTE: this means we ran out of file descriptors and there is no
+    # reason to try to proceed, as we will hit this error anyways.
+    # pylint: disable=no-member
+    if isinstance(exc, OSError) and exc.errno == errno.EMFILE:
+        raise exc
+    logger.error("failed to transfer '%s'", oid, exc_info=exc)
 
 
 def find_tree_by_obj_id(
-    odbs: Iterable[Optional["ObjectDB"]], obj_id: "HashInfo"
+    odbs: Iterable[Optional["HashFileDB"]], obj_id: "HashInfo"
 ) -> Optional["Tree"]:
     from dvc_objects.errors import ObjectFormatError
 
@@ -68,16 +61,13 @@ def find_tree_by_obj_id(
 
 
 def _do_transfer(
-    src: "ObjectDB",
-    dest: "ObjectDB",
+    src: "HashFileDB",
+    dest: "HashFileDB",
     obj_ids: Iterable["HashInfo"],
     missing_ids: Iterable["HashInfo"],
-    processor: Callable[
-        [Iterable["HashInfo"]], Iterable[Optional["HashInfo"]]
-    ],
     src_index: Optional["ObjectDBIndexBase"] = None,
     dest_index: Optional["ObjectDBIndexBase"] = None,
-    cache_odb: Optional["ObjectDB"] = None,
+    cache_odb: Optional["HashFileDB"] = None,
     **kwargs: Any,
 ) -> Set["HashInfo"]:
     """Do object transfer.
@@ -98,11 +88,7 @@ def _do_transfer(
         bound_file_ids = all_file_ids & entry_ids
         all_file_ids -= entry_ids
 
-        dir_fails = [
-            hash_info
-            for hash_info in processor(bound_file_ids)
-            if hash_info is not None
-        ]
+        dir_fails = _add(src, dest, bound_file_ids, **kwargs)
         if dir_fails:
             logger.debug(
                 "failed to upload full contents of '%s', "
@@ -127,22 +113,13 @@ def _do_transfer(
                 dir_hash,
             )
         else:
-            is_dir_failed = any(
-                hash_info
-                for hash_info in processor([dir_obj.hash_info])
-                if hash_info is not None
-            )
-            if is_dir_failed:
+            if _add(src, dest, [dir_obj.hash_info], **kwargs):
                 failed_ids.add(dir_obj.hash_info)
             else:
                 succeeded_dir_objs.append(dir_obj)
 
     # insert the rest
-    failed_ids.update(
-        hash_info
-        for hash_info in processor(all_file_ids)
-        if hash_info is not None
-    )
+    failed_ids.update(_add(src, dest, all_file_ids, **kwargs))
     if failed_ids:
         if src_index:
             src_index.clear()
@@ -163,15 +140,51 @@ def _do_transfer(
     return set()
 
 
+def _add(
+    src: "HashFileDB",
+    dest: "HashFileDB",
+    hash_infos: Iterable["HashInfo"],
+    **kwargs,
+) -> Set["HashInfo"]:
+
+    failed: Set["HashInfo"] = set()
+    if not hash_infos:
+        return failed
+
+    def _error(oid: str, exc: BaseException):
+        _log_exception(oid, exc)
+        failed.add(HashInfo(src.hash_name, oid))
+
+    fs_map: Dict["FileSystem", List[Tuple[str, str]]] = defaultdict(list)
+    for hash_info in hash_infos:
+        assert hash_info.value
+        obj = src.get(hash_info.value)
+        fs_map[obj.fs].append((obj.path, obj.oid))
+
+    for fs, args in fs_map.items():
+        paths, oids = zip(*args)
+        dest.add(
+            list(paths),
+            fs,
+            list(oids),
+            on_error=_error,
+            **kwargs,
+        )
+    return failed
+
+
 def transfer(
-    src: "ObjectDB",
-    dest: "ObjectDB",
+    src: "HashFileDB",
+    dest: "HashFileDB",
     obj_ids: Iterable["HashInfo"],
     jobs: Optional[int] = None,
     verify: bool = False,
     hardlink: bool = False,
     validate_status: Callable[["CompareStatusResult"], None] = None,
-    **kwargs,
+    src_index: Optional["ObjectDBIndexBase"] = None,
+    dest_index: Optional["ObjectDBIndexBase"] = None,
+    cache_odb: Optional["HashFileDB"] = None,
+    shallow: bool = True,
 ) -> "TransferResult":
     """Transfer (copy) the specified objects from one ODB to another.
 
@@ -188,7 +201,15 @@ def transfer(
         return TransferResult(set(), set())
 
     status = compare_status(
-        src, dest, obj_ids, check_deleted=False, jobs=jobs, **kwargs
+        src,
+        dest,
+        obj_ids,
+        check_deleted=False,
+        jobs=jobs,
+        src_index=src_index,
+        dest_index=dest_index,
+        cache_odb=cache_odb,
+        shallow=shallow,
     )
 
     if validate_status:
@@ -197,23 +218,25 @@ def transfer(
     if not status.new:
         return TransferResult(set(), set())
 
-    def func(hash_info: "HashInfo") -> None:
-        obj = src.get(hash_info.value)
-        return dest.add(
-            obj.path,
-            obj.fs,
-            obj.oid,
-            verify=verify,
-            hardlink=hardlink,
-        )
-
     total = len(status.new)
     jobs = jobs or dest.fs.jobs
-    with Tqdm(total=total, unit="file", desc="Transferring") as pbar:
-        with ThreadPoolExecutor(max_workers=jobs) as executor:
-            wrapped_func = pbar.wrap_fn(_log_exceptions(func))
-            processor = partial(executor.imap_unordered, wrapped_func)
-            failed = _do_transfer(
-                src, dest, status.new, status.missing, processor, **kwargs
-            )
+    with Callback.as_tqdm_callback(
+        total=total,
+        unit="file",
+        desc="Transferring",
+    ) as cb:
+        failed = _do_transfer(
+            src,
+            dest,
+            status.new,
+            status.missing,
+            verify=verify,
+            hardlink=hardlink,
+            callback=cb,
+            batch_size=jobs,
+            check_exists=False,
+            src_index=src_index,
+            dest_index=dest_index,
+            cache_odb=cache_odb,
+        )
     return TransferResult(status.new - failed, failed)

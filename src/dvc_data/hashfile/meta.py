@@ -1,11 +1,7 @@
 from typing import Any, ClassVar, Dict, List, Optional
 
-from attrs import Attribute, asdict, define, fields_dict
+from attrs import define, field, fields_dict
 from dvc_objects.fs.utils import is_exec
-
-
-def _filter_default_or_none(field: Attribute, value: Any) -> bool:
-    return value is not None and value != field.default
 
 
 @define
@@ -20,6 +16,7 @@ class Meta:
     PARAM_MD5: ClassVar[str] = "md5"
     PARAM_INODE: ClassVar[str] = "inode"
     PARAM_MTIME: ClassVar[str] = "mtime"
+    PARAM_REMOTE: ClassVar[str] = "remote"
 
     fields: ClassVar[List[str]]
 
@@ -33,6 +30,8 @@ class Meta:
     md5: Optional[str] = None
     inode: Optional[int] = None
     mtime: Optional[float] = None
+
+    remote: Optional[str] = field(default=None, eq=False)
 
     @classmethod
     def from_info(
@@ -63,6 +62,8 @@ class Meta:
         version_id = info.get("version_id")
         if protocol == "s3" and "VersionId" in info:
             version_id = info.get("VersionId")
+        elif protocol == "gs" and "generation" in info:
+            version_id = info.get("generation")
 
         return Meta(
             isdir=info["type"] == "directory",
@@ -74,23 +75,48 @@ class Meta:
             md5=info.get("md5"),
             inode=info.get("ino"),
             mtime=info.get("mtime"),
+            remote=info.get("remote"),
         )
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Meta":
         kwargs = {}
-        for field in cls.fields:
-            if field in d:
-                kwargs[field] = d[field]
+        for field_ in cls.fields:
+            if field_ in d:
+                kwargs[field_] = d[field_]
         return cls(**kwargs)
 
     def to_dict(self) -> Dict[str, Any]:
-        def _filter(field: Attribute, value: Any) -> bool:
-            if field.name in (self.PARAM_INODE, self.PARAM_MTIME):
-                return False
-            return _filter_default_or_none(field, value)
+        ret: Dict[str, Any] = {}
 
-        return asdict(self, recurse=False, filter=_filter)
+        if self.isdir:
+            ret[self.PARAM_ISDIR] = self.isdir
+
+        if self.size is not None:
+            ret[self.PARAM_SIZE] = self.size
+
+        if self.nfiles is not None:
+            ret[self.PARAM_NFILES] = self.nfiles
+
+        if self.isexec:
+            ret[self.PARAM_ISEXEC] = self.isexec
+
+        if self.version_id:
+            ret[self.PARAM_VERSION_ID] = self.version_id
+
+        if self.etag:
+            ret[self.PARAM_ETAG] = self.etag
+
+        if self.checksum:
+            ret[self.PARAM_CHECKSUM] = self.checksum
+
+        if self.md5:
+            ret[self.PARAM_MD5] = self.md5
+
+        if self.remote:
+            ret[self.PARAM_REMOTE] = self.remote
+
+        return ret
 
 
 Meta.fields = list(fields_dict(Meta))

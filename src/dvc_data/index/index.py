@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 from collections import defaultdict
+from copy import copy
 from dataclasses import dataclass
+from functools import cached_property
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -12,11 +14,12 @@ from typing import (
     MutableMapping,
     Optional,
     Tuple,
+    cast,
 )
 
 from dvc_objects.errors import ObjectFormatError
-from pygtrie import ShortKeyError  # noqa: F401, pylint: disable=unused-import
-from pygtrie import Trie
+from sqltrie import ShortKeyError  # noqa: F401, pylint: disable=unused-import
+from sqltrie import JSONTrie, PyGTrie, SQLiteTrie
 
 from ..hashfile.hash_info import HashInfo
 from ..hashfile.meta import Meta
@@ -29,7 +32,7 @@ if TYPE_CHECKING:
     from ..hashfile.obj import HashFile
 
 
-DataIndexKey = Tuple[str]
+DataIndexKey = Tuple[str, ...]
 
 
 @dataclass(unsafe_hash=True)
@@ -38,12 +41,6 @@ class DataIndexEntry:
     meta: Optional["Meta"] = None
     obj: Optional["HashFile"] = None
     hash_info: Optional["HashInfo"] = None
-    odb: Optional["HashFileDB"] = None
-    cache: Optional["HashFileDB"] = None
-    remote: Optional["HashFileDB"] = None
-
-    fs: Optional["FileSystem"] = None
-    path: Optional["str"] = None
 
     loaded: Optional[bool] = None
 
@@ -59,10 +56,12 @@ class DataIndexEntry:
         if hash_info:
             ret.hash_info = HashInfo.from_dict(hash_info)
 
+        ret.loaded = cast(bool, d["loaded"])
+
         return ret
 
-    def to_dict(self) -> Dict[str, Dict]:
-        ret = {}
+    def to_dict(self) -> Dict[str, Any]:
+        ret: Dict[str, Any] = {}
 
         if self.meta:
             ret["meta"] = self.meta.to_dict()
@@ -70,7 +69,47 @@ class DataIndexEntry:
         if self.hash_info:
             ret["hash_info"] = self.hash_info.to_dict()
 
+        ret["loaded"] = self.loaded
+
         return ret
+
+
+class DataIndexTrie(JSONTrie):
+    def __init__(self, *args, **kwargs):
+        self._cache = {}
+        super().__init__(*args, **kwargs)
+
+    @cached_property
+    def _trie(self):
+        return SQLiteTrie()
+
+    @classmethod
+    def open(cls, path):
+        ret = cls()
+        ret._trie = SQLiteTrie.open(path)
+        return ret
+
+    def _load(self, key, value):
+        try:
+            return self._cache[key]
+        except KeyError:
+            pass
+        if value is None:
+            return None
+        entry = DataIndexEntry.from_dict(super()._load(key, value))
+        entry.key = key
+        return entry
+
+    def _dump(self, key, value):
+        if key not in self._cache:
+            self._cache[key] = value
+        if value is None:
+            return None
+        return super()._dump(key, value.to_dict())
+
+    def __delitem__(self, key):
+        self._cache.pop(key, None)
+        super().__delitem__(key)
 
 
 def _try_load(
@@ -89,10 +128,57 @@ def _try_load(
     return None
 
 
+@dataclass
+class Storage:
+    """Describes where the data contents could be found"""
+
+    fs: Optional["FileSystem"] = None
+    path: Optional[str] = None
+    odb: Optional["HashFileDB"] = None
+    remote: Optional["HashFileDB"] = None
+
+
+class StorageMapping(MutableMapping):
+    def __init__(self, *args, **kwargs):
+        self._map = dict(*args, **kwargs)
+
+    def __setitem__(self, key, value):
+        self._map[key] = value
+
+    def __delitem__(self, key):
+        del self._map[key]
+
+    def __getitem__(self, key):
+        for prefix, storage in self._map.items():
+            if len(prefix) > len(key):
+                continue
+
+            if key[: len(prefix)] == prefix:
+                if storage.path:
+                    storage = copy(storage)
+                    storage.path = storage.fs.path.join(
+                        storage.path,
+                        *key[len(prefix) :],
+                    )
+                return storage
+
+        return None
+
+    def __iter__(self):
+        yield from self._map.keys()
+
+    def __len__(self):
+        return len(self._map)
+
+
 class BaseDataIndex(ABC, Mapping[DataIndexKey, DataIndexEntry]):
+    storage_map: StorageMapping
+
     @abstractmethod
     def iteritems(
-        self, prefix: Optional[DataIndexKey] = None, shallow: bool = False
+        self,
+        prefix: Optional[DataIndexKey] = None,
+        shallow: Optional[bool] = False,
     ) -> Iterator[Tuple[DataIndexKey, DataIndexEntry]]:
         pass
 
@@ -110,45 +196,8 @@ class BaseDataIndex(ABC, Mapping[DataIndexKey, DataIndexEntry]):
     ) -> Tuple[Optional[DataIndexKey], Optional[DataIndexEntry]]:
         pass
 
-    def ls(self, root_key: DataIndexKey, detail=True):
-        if not detail:
-
-            def node_factory(_, key, children, *args):
-                if key == root_key:
-                    return children
-                else:
-                    return key
-
-        else:
-
-            def node_factory(_, key, children, *args):
-                if key == root_key:
-                    return children
-                else:
-                    return key, self.info(key)
-
-        return self.traverse(node_factory, prefix=root_key)
-
-    def info(self, key: DataIndexKey):
-        try:
-            entry = self[key]
-            isdir = entry.meta and entry.meta.isdir
-            ret = {
-                "type": "directory" if isdir else "file",
-                "size": entry.meta.size if entry.meta else 0,
-                "isexec": entry.meta.isexec if entry.meta else False,
-                "isdvc": True,
-                "isout": True,
-                "obj": entry.obj,
-                "entry": entry,
-            }
-
-            if entry.hash_info:
-                assert entry.hash_info.name
-                ret[entry.hash_info.name] = entry.hash_info.value
-
-            return ret
-        except ShortKeyError:
+    def _info_from_entry(self, key, entry):
+        if entry is None:
             return {
                 "type": "directory",
                 "size": 0,
@@ -158,13 +207,69 @@ class BaseDataIndex(ABC, Mapping[DataIndexKey, DataIndexEntry]):
                 "obj": None,
                 "entry": None,
             }
+
+        isdir = entry.meta and entry.meta.isdir
+        ret = {
+            "type": "directory" if isdir else "file",
+            "size": entry.meta.size if entry.meta else 0,
+            "isexec": entry.meta.isexec if entry.meta else False,
+            "isdvc": True,
+            "isout": True,
+            "obj": entry.obj,
+            "entry": entry,
+        }
+
+        if entry.hash_info:
+            assert entry.hash_info.name
+            ret[entry.hash_info.name] = entry.hash_info.value
+
+        return ret
+
+    @abstractmethod
+    def ls(self, root_key: DataIndexKey, detail=True):
+        pass
+
+    def info(self, key: DataIndexKey):
+        try:
+            entry = self[key]
+        except ShortKeyError:
+            entry = None
         except KeyError as exc:
             raise FileNotFoundError from exc
+
+        return self._info_from_entry(key, entry)
 
 
 class DataIndex(BaseDataIndex, MutableMapping[DataIndexKey, DataIndexEntry]):
     def __init__(self, *args, **kwargs):
-        self._trie = Trie(*args, **kwargs)
+        # NOTE: by default, using an in-memory pygtrie trie that doesn't
+        # serialize values, so we can save some time.
+        self._trie = PyGTrie()
+
+        self.storage_map = StorageMapping()
+
+        self.update(*args, **kwargs)
+
+    @classmethod
+    def open(cls, path):
+        ret = cls()
+        ret._trie = DataIndexTrie.open(path)
+        return ret
+
+    def view(self, key):
+        ret = DataIndex()
+        ret._trie = self._trie.view(key)  # pylint: disable=protected-access
+        ret.storage_map = self.storage_map
+        return ret
+
+    def commit(self):
+        self._trie.commit()
+
+    def rollback(self):
+        self._trie.rollback()
+
+    def close(self):
+        self._trie.close()
 
     def __setitem__(self, key, value):
         self._trie[key] = value
@@ -174,8 +279,11 @@ class DataIndex(BaseDataIndex, MutableMapping[DataIndexKey, DataIndexEntry]):
         if item:
             return item
 
-        dir_key, dir_entry = self._trie.longest_prefix(key)
-        self._load(dir_key, dir_entry)
+        lprefix = self._trie.longest_prefix(key)
+        if lprefix is not None:
+            dir_key, dir_entry = lprefix
+            self._load(dir_key, dir_entry)
+
         return self._trie[key]
 
     def __delitem__(self, key):
@@ -207,7 +315,10 @@ class DataIndex(BaseDataIndex, MutableMapping[DataIndexKey, DataIndexEntry]):
             return
 
         if not entry.obj:
-            entry.obj = _try_load([entry.odb, entry.remote], entry.hash_info)
+            storage = self.storage_map.get(key)
+            entry.obj = _try_load(
+                [storage.odb, storage.remote], entry.hash_info
+            )
 
         if not entry.obj:
             return
@@ -226,28 +337,22 @@ class DataIndex(BaseDataIndex, MutableMapping[DataIndexKey, DataIndexEntry]):
             entry_key = key + ikey
             child_entry = DataIndexEntry(
                 key=entry_key,
-                odb=entry.odb,
-                cache=entry.odb,
-                remote=entry.remote,
                 hash_info=hash_info,
                 meta=meta,
             )
-            if entry.fs and entry.path:
-                child_entry.fs = entry.fs
-                child_entry.path = entry.fs.path.join(entry.path, *ikey)
             self._trie[entry_key] = child_entry
 
         for dkey in dirs:
             entry_key = key + dkey
             self._trie[entry_key] = DataIndexEntry(
                 key=entry_key,
-                odb=entry.odb,
-                cache=entry.odb,
-                remote=entry.remote,
                 meta=Meta(isdir=True),
             )
 
         entry.loaded = True
+        del self._trie[key]
+        self._trie[key] = entry
+        self._trie.commit()
 
     def load(self, **kwargs):
         for key, entry in self.iteritems(shallow=True, **kwargs):
@@ -268,7 +373,9 @@ class DataIndex(BaseDataIndex, MutableMapping[DataIndexKey, DataIndexEntry]):
         return self._trie.traverse(*args, **kwargs)
 
     def iteritems(
-        self, prefix: Optional[DataIndexKey] = None, shallow: bool = False
+        self,
+        prefix: Optional[DataIndexKey] = None,
+        shallow: Optional[bool] = False,
     ) -> Iterator[Tuple[DataIndexKey, DataIndexEntry]]:
         kwargs: Dict[str, Any] = {"shallow": shallow}
         if prefix:
@@ -278,12 +385,14 @@ class DataIndex(BaseDataIndex, MutableMapping[DataIndexKey, DataIndexEntry]):
                 key, entry = item
                 self._load(key, entry)
 
-        for key, entry in self._trie.iteritems(**kwargs):
+        # FIXME could filter by loaded and/or isdir in sql on sqltrie side
+        for key, entry in self._trie.items(**kwargs):
             self._load(key, entry)
-            yield key, entry
+
+        yield from self._trie.items(**kwargs)
 
     def iterkeys(self, *args, **kwargs):
-        return self._trie.iterkeys(*args, **kwargs)
+        return self._trie.keys(*args, **kwargs)
 
     def _ensure_loaded(self, prefix):
         entry = self._trie.get(prefix)
@@ -299,7 +408,13 @@ class DataIndex(BaseDataIndex, MutableMapping[DataIndexKey, DataIndexEntry]):
 
     def ls(self, root_key: DataIndexKey, detail=True):
         self._ensure_loaded(root_key)
-        return super().ls(root_key, detail=detail)
+        if detail:
+            yield from (
+                (key, self._info_from_entry(key, entry))
+                for key, entry in self._trie.ls(root_key, with_values=True)
+            )
+        else:
+            yield from self._trie.ls(root_key)
 
 
 def transfer(index, src, dst):
