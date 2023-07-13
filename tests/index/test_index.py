@@ -1,17 +1,16 @@
 import pytest
 
+import dvc_data.index.checkout as checkout
 from dvc_data.fs import DataFileSystem
-from dvc_data.hashfile.db import HashFileDB
 from dvc_data.hashfile.hash_info import HashInfo
 from dvc_data.hashfile.meta import Meta
 from dvc_data.index import (
     DataIndex,
     DataIndexEntry,
-    Storage,
-    StorageMapping,
+    FileStorage,
+    ObjectStorage,
     add,
     build,
-    checkout,
     md5,
     read_db,
     read_json,
@@ -21,35 +20,6 @@ from dvc_data.index import (
     write_db,
     write_json,
 )
-
-
-@pytest.fixture
-def odb(tmp_upath_factory, as_filesystem):
-    path = tmp_upath_factory.mktemp()
-    fs = as_filesystem(path.fs)
-    odb = HashFileDB(fs, path)
-
-    foo = tmp_upath_factory.mktemp() / "foo"
-    foo.write_bytes(b"foo\n")
-
-    data = tmp_upath_factory.mktemp() / "data.dir"
-    data.write_bytes(
-        b'[{"md5": "c157a79031e1c40f85931829bc5fc552", "relpath": "bar"}, '
-        b'{"md5": "258622b1688250cb619f3c9ccaefb7eb", "relpath": "baz"}]'
-    )
-
-    bar = tmp_upath_factory.mktemp() / "bar"
-    bar.write_bytes(b"bar\n")
-
-    baz = tmp_upath_factory.mktemp() / "baz"
-    baz.write_bytes(b"baz\n")
-
-    odb.add(str(foo), fs, "d3b07384d113edec49eaa6238ad5ff00")
-    odb.add(str(data), fs, "1f69c66028c35037e8bf67e5bc4ceb6a.dir")
-    odb.add(str(bar), fs, "c157a79031e1c40f85931829bc5fc552")
-    odb.add(str(baz), fs, "258622b1688250cb619f3c9ccaefb7eb")
-
-    return odb
 
 
 def test_index():
@@ -76,9 +46,7 @@ def test_fs(tmp_upath, odb, as_filesystem):
             ),
         }
     )
-    index.storage_map = StorageMapping(
-        {("foo",): Storage(odb=odb), ("data",): Storage(odb=odb)}
-    )
+    index.storage_map.add_cache(ObjectStorage((), odb))
     fs = DataFileSystem(index)
     assert fs.exists("foo")
     assert fs.cat("foo") == b"foo\n"
@@ -91,6 +59,51 @@ def test_fs(tmp_upath, odb, as_filesystem):
         fs.info("/data/bar"),
         fs.info("/data/baz"),
     ]
+
+
+def test_fs_file_storage(tmp_upath, as_filesystem):
+    (tmp_upath / "foo").write_bytes(b"foo\n")
+    (tmp_upath / "data").mkdir()
+    (tmp_upath / "data" / "bar").write_bytes(b"bar\n")
+    (tmp_upath / "data" / "baz").write_bytes(b"baz\n")
+
+    index = DataIndex(
+        {
+            ("foo",): DataIndexEntry(
+                key=("foo",),
+            ),
+            ("data",): DataIndexEntry(
+                key=("data",),
+            ),
+        }
+    )
+    index.storage_map.add_cache(
+        FileStorage((), as_filesystem(tmp_upath.fs), str(tmp_upath))
+    )
+    fs = DataFileSystem(index)
+    assert fs.exists("foo")
+    assert fs.cat("foo") == b"foo\n"
+    assert sorted(fs.ls("/", detail=False)) == sorted(["/foo", "/data"])
+    assert sorted(
+        fs.ls("/", detail=True), key=lambda entry: entry["name"]
+    ) == sorted(
+        [fs.info("/foo"), fs.info("/data")],
+        key=lambda entry: entry["name"],
+    )
+    assert fs.cat("/data/bar") == b"bar\n"
+    assert fs.cat("/data/baz") == b"baz\n"
+    assert sorted(fs.ls("/data", detail=False)) == sorted(
+        ["/data/bar", "/data/baz"]
+    )
+    assert sorted(
+        fs.ls("/data", detail=True), key=lambda entry: entry["name"]
+    ) == sorted(
+        [
+            fs.info("/data/bar"),
+            fs.info("/data/baz"),
+        ],
+        key=lambda entry: entry["name"],
+    )
 
 
 def test_md5(tmp_upath, odb, as_filesystem):
@@ -132,30 +145,6 @@ def test_save(tmp_upath, odb, as_filesystem):
     assert odb.exists("258622b1688250cb619f3c9ccaefb7eb")
 
 
-def test_build(tmp_upath, as_filesystem):
-    (tmp_upath / "foo").write_bytes(b"foo\n")
-    (tmp_upath / "data").mkdir()
-    (tmp_upath / "data" / "bar").write_bytes(b"bar\n")
-    (tmp_upath / "data" / "baz").write_bytes(b"baz\n")
-
-    fs = as_filesystem(tmp_upath.fs)
-    index = build(str(tmp_upath), fs)
-    assert index[("foo",)].meta.size == 4
-    assert index.storage_map[("foo",)].fs == fs
-    assert index.storage_map[("foo",)].path == str(tmp_upath / "foo")
-    assert index[("data",)].meta.isdir
-    assert index[("data", "bar")].meta.size == 4
-    assert index.storage_map[("data", "bar")].fs == fs
-    assert index.storage_map[("data", "bar")].path == str(
-        tmp_upath / "data" / "bar"
-    )
-    assert index[("data", "baz")].meta.size == 4
-    assert index.storage_map[("data", "baz")].fs == fs
-    assert index.storage_map[("data", "baz")].path == str(
-        tmp_upath / "data" / "baz"
-    )
-
-
 def test_add(tmp_upath, as_filesystem):
     (tmp_upath / "foo").write_bytes(b"foo\n")
     (tmp_upath / "data").mkdir()
@@ -169,28 +158,34 @@ def test_add(tmp_upath, as_filesystem):
     add(index, str(tmp_upath / "foo"), fs, ("foo",))
     assert len(index) == 1
     assert index[("foo",)].meta.size == 4
-    assert index.storage_map[("foo",)].fs == fs
-    assert index.storage_map[("foo",)].path == str(tmp_upath / "foo")
+    assert index.storage_map.get_data(index[("foo",)]) == (
+        fs,
+        str(tmp_upath / "foo"),
+    )
 
     add(index, str(tmp_upath / "data"), fs, ("data",))
     assert len(index) == 4
     assert index[("foo",)].meta.size == 4
-    assert index.storage_map[("foo",)].fs == fs
-    assert index.storage_map[("foo",)].path == str(tmp_upath / "foo")
+    assert index.storage_map.get_data(index[("foo",)]) == (
+        fs,
+        str(tmp_upath / "foo"),
+    )
     assert index[("data",)].meta.isdir
     assert index[("data", "bar")].meta.size == 4
-    assert index.storage_map[("data", "bar")].fs == fs
-    assert index.storage_map[("data", "bar")].path == str(
-        tmp_upath / "data" / "bar"
+    assert index.storage_map.get_data(index[("data", "bar")]) == (
+        fs,
+        str(tmp_upath / "data" / "bar"),
     )
     assert index[("data", "baz")].meta.size == 4
-    assert index.storage_map[("data", "baz")].fs == fs
-    assert index.storage_map[("data", "baz")].path == str(
-        tmp_upath / "data" / "baz"
+    assert index.storage_map.get_data(index[("data", "baz")]) == (
+        fs,
+        str(tmp_upath / "data" / "baz"),
     )
 
 
-def test_checkout(tmp_upath, odb, as_filesystem):
+def test_fetch(tmp_upath, make_odb, odb, as_filesystem):
+    from dvc_data.index.fetch import collect, fetch
+
     index = DataIndex(
         {
             ("foo",): DataIndexEntry(
@@ -210,21 +205,31 @@ def test_checkout(tmp_upath, odb, as_filesystem):
             ),
         }
     )
-    index.storage_map = StorageMapping(
-        {("foo",): Storage(odb=odb), ("data",): Storage(odb=odb)}
+    cache_odb = make_odb()
+    index.storage_map.add_cache(ObjectStorage((), cache_odb))
+    index.storage_map.add_remote(ObjectStorage((), odb))
+
+    (tmp_upath / "fetched").mkdir()
+    data = collect([index], "remote")
+    fetch(data)
+    diff = checkout.compare(None, index)
+    checkout.apply(
+        diff,
+        str(tmp_upath / "checkout"),
+        as_filesystem(tmp_upath.fs),
+        storage="cache",
     )
-    checkout(index, str(tmp_upath), as_filesystem(tmp_upath.fs))
-    assert (tmp_upath / "foo").read_text() == "foo\n"
-    assert (tmp_upath / "data").is_dir()
-    assert (tmp_upath / "data" / "bar").read_text() == "bar\n"
-    assert (tmp_upath / "data" / "baz").read_text() == "baz\n"
-    assert set(tmp_upath.iterdir()) == {
-        (tmp_upath / "foo"),
-        (tmp_upath / "data"),
+    assert (tmp_upath / "checkout" / "foo").read_text() == "foo\n"
+    assert (tmp_upath / "checkout" / "data").is_dir()
+    assert (tmp_upath / "checkout" / "data" / "bar").read_text() == "bar\n"
+    assert (tmp_upath / "checkout" / "data" / "baz").read_text() == "baz\n"
+    assert set((tmp_upath / "checkout").iterdir()) == {
+        (tmp_upath / "checkout" / "foo"),
+        (tmp_upath / "checkout" / "data"),
     }
-    assert set((tmp_upath / "data").iterdir()) == {
-        (tmp_upath / "data" / "bar"),
-        (tmp_upath / "data" / "baz"),
+    assert set((tmp_upath / "checkout" / "data").iterdir()) == {
+        (tmp_upath / "checkout" / "data" / "bar"),
+        (tmp_upath / "checkout" / "data" / "baz"),
     }
 
 
@@ -291,19 +296,22 @@ def test_view_iteritems(odb, keys, filter_fn, ensure_loaded):
     index = DataIndex(
         {
             ("foo",): DataIndexEntry(
+                key=("foo",),
                 hash_info=HashInfo(
                     name="md5", value="d3b07384d113edec49eaa6238ad5ff00"
                 ),
             ),
             ("dir", "subdir", "bar"): DataIndexEntry(
+                key=("dir", "subdir", "bar"),
                 hash_info=HashInfo(
                     name="md5",
                     value="1f69c66028c35037e8bf67e5bc4ceb6a.dir",
                 ),
+                meta=Meta(isdir=True),
             ),
         }
     )
-    index.storage_map = StorageMapping({("dir",): Storage(odb=odb)})
+    index.storage_map.add_cache(ObjectStorage((), odb))
     index_view = view(index, filter_fn)
     assert keys == {
         key for key, _ in index_view._iteritems(ensure_loaded=ensure_loaded)
@@ -311,16 +319,19 @@ def test_view_iteritems(odb, keys, filter_fn, ensure_loaded):
 
 
 def test_view(odb):
+    expected_key = ("dir", "subdir", "bar")
     expected_entry = DataIndexEntry(
+        key=expected_key,
+        meta=Meta(isdir=True),
         hash_info=HashInfo(
             name="md5",
             value="1f69c66028c35037e8bf67e5bc4ceb6a.dir",
         ),
     )
-    expected_key = ("dir", "subdir", "bar")
     index = DataIndex(
         {
             ("foo",): DataIndexEntry(
+                key=("foo",),
                 hash_info=HashInfo(
                     name="md5", value="d3b07384d113edec49eaa6238ad5ff00"
                 ),
@@ -328,7 +339,7 @@ def test_view(odb):
             expected_key: expected_entry,
         }
     )
-    index.storage_map = StorageMapping({("dir",): Storage(odb=odb)})
+    index.storage_map.add_cache(ObjectStorage((), odb))
     index_view = view(index, lambda k: "dir" in k)
     assert {expected_key} == set(index_view.keys())
     assert expected_key in index_view
@@ -357,7 +368,7 @@ def test_view_ls(odb):
             ),
         }
     )
-    index.storage_map = StorageMapping({("dir",): Storage(odb=odb)})
+    index.storage_map.add_cache(ObjectStorage((), odb))
     index_view = view(index, lambda k: "dir" in k)
     assert list(index_view.ls((), detail=False)) == [("dir",)]
     assert list(index_view.ls(("dir",), detail=False)) == [
@@ -387,7 +398,7 @@ def test_view_traverse(odb):
             ),
         }
     )
-    index.storage_map = StorageMapping({("dir",): Storage(odb=odb)})
+    index.storage_map.add_cache(ObjectStorage((), odb))
     index_view = view(index, lambda k: "dir" in k)
 
     keys = []

@@ -1,4 +1,7 @@
+import copy
+import errno
 import logging
+import os
 import typing
 
 from dvc_objects.fs.callbacks import DEFAULT_CALLBACK
@@ -43,69 +46,76 @@ class DataFileSystem(AbstractFileSystem):  # pylint:disable=abstract-method
         return key
 
     def _get_fs_path(self, path: "AnyFSPath"):
+        from .index import StorageKeyError
+
         info = self.info(path)
         if info["type"] == "directory":
-            raise IsADirectoryError
-
-        value = info.get("md5")
-        if not value:
-            raise FileNotFoundError
+            raise IsADirectoryError(
+                errno.EISDIR, os.strerror(errno.EISDIR), path
+            )
 
         entry = info["entry"]
 
-        storage = self.index.storage_map.get(entry.key)
-        odb = storage.odb
-        if odb:
-            cache_path = odb.oid_to_path(value)
-            if odb.fs.exists(cache_path):
-                return odb.fs, cache_path
+        for typ in ["cache", "remote", "data"]:
+            try:
+                info = self.index.storage_map[entry.key]
+                storage = getattr(info, typ)
+                if not storage:
+                    continue
+                data = storage.get(entry)
+            except (ValueError, StorageKeyError):
+                continue
+            if data:
+                fs, fs_path = data
+                if fs.exists(fs_path):
+                    return typ, storage, fs, fs_path
 
-        remote = storage.remote
-        if remote:
-            remote_path = remote.oid_to_path(value)
-            return remote.fs, remote_path
-
-        raise FileNotFoundError
+        raise FileNotFoundError(
+            errno.ENOENT, "No storage files available", path
+        )
 
     def open(  # type: ignore
         self, path: str, mode="r", encoding=None, **kwargs
     ):  # pylint: disable=arguments-renamed, arguments-differ
-        fs, fspath = self._get_fs_path(path, **kwargs)
+        cache_odb = kwargs.pop("cache_odb", None)
+        typ, _, fs, fspath = self._get_fs_path(path, **kwargs)
+
+        if cache_odb and typ == "remote":
+            from dvc_data.hashfile.build import _upload_file
+
+            _, obj = _upload_file(fspath, fs, cache_odb, cache_odb)
+            fs, fspath = cache_odb.fs, obj.path
+
         return fs.open(fspath, mode=mode, encoding=encoding)
 
     def ls(self, path, detail=True, **kwargs):
+        from .index import TreeError
+
         root_key = self._get_key(path)
-        info = self.index.info(root_key)
-        if info["type"] != "directory":
-            if detail:
-                info["name"] = path
-                return [info]
-            else:
-                return [path]
-
-        if not detail:
-            return [
-                self.path.join(path, key[-1])
-                for key in self.index.ls(root_key, detail=False)
-            ]
-
-        entries = []
-        for key, info in self.index.ls(root_key, detail=True):
-            info["name"] = self.path.join(path, key[-1])
-            entries.append(info)
-        return entries
-
-    def isdvc(self, path, recursive=False):
         try:
-            info = self.info(path)
-        except FileNotFoundError:
-            return False
+            info = self.index.info(root_key)
+            if info["type"] != "directory":
+                if detail:
+                    info["name"] = path
+                    return [info]
+                else:
+                    return [path]
 
-        if not recursive:
-            return info.get("isout")
+            if not detail:
+                return [
+                    self.path.join(path, key[-1])
+                    for key in self.index.ls(root_key, detail=False)
+                ]
 
-        key = self._get_key(path)
-        return self.index.has_node(key)
+            entries = []
+            for key, info in self.index.ls(root_key, detail=True):
+                info["name"] = self.path.join(path, key[-1])
+                entries.append(info)
+            return entries
+        except TreeError as exc:
+            raise FileNotFoundError(
+                errno.ENOENT, os.strerror(errno.ENOENT), path
+            ) from exc
 
     def info(self, path, **kwargs):
         key = self._get_key(path)
@@ -116,7 +126,35 @@ class DataFileSystem(AbstractFileSystem):  # pylint:disable=abstract-method
     def get_file(  # pylint: disable=arguments-differ
         self, rpath, lpath, callback=DEFAULT_CALLBACK, **kwargs
     ):
-        fs, path = self._get_fs_path(rpath)
+        from dvc_objects.fs.generic import transfer
+        from dvc_objects.fs.local import LocalFileSystem
+
+        from dvc_data.index import ObjectStorage
+
+        try:
+            _, storage, fs, path = self._get_fs_path(rpath)
+        except IsADirectoryError:
+            os.makedirs(lpath, exist_ok=True)
+            return None
+
+        if (
+            isinstance(storage, ObjectStorage)
+            and isinstance(fs, LocalFileSystem)
+            and storage.odb.cache_types
+        ):
+            try:
+                transfer(
+                    fs,
+                    path,
+                    fs,
+                    os.fspath(lpath),
+                    callback=callback,
+                    links=copy.copy(storage.odb.cache_types),
+                )
+                return
+            except OSError:
+                pass
+
         fs.get_file(path, lpath, callback=callback, **kwargs)
 
     def checksum(self, path):

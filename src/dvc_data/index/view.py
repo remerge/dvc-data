@@ -1,15 +1,6 @@
 from collections import deque
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Iterator,
-    Optional,
-    Tuple,
-    cast,
-)
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional, Tuple
 
-from ..hashfile.tree import Tree
 from .index import BaseDataIndex, DataIndex, DataIndexEntry, DataIndexKey
 
 if TYPE_CHECKING:
@@ -29,10 +20,22 @@ class DataIndexView(BaseDataIndex):
     def storage_map(self) -> "StorageMapping":  # type: ignore[override]
         return self._index.storage_map
 
-    def __getitem__(self, key: DataIndexKey) -> DataIndexEntry:
+    def __setitem__(self, key, value):
         if self.filter_fn(key):
+            self._index[key] = value
+        else:
+            raise KeyError
+
+    def __getitem__(self, key: DataIndexKey) -> DataIndexEntry:
+        if key == () or self.filter_fn(key):
             return self._index[key]
         raise KeyError
+
+    def __delitem__(self, key: DataIndexKey):
+        if self.filter_fn(key):
+            del self._index[key]
+        else:
+            raise KeyError
 
     def __iter__(self) -> Iterator[DataIndexKey]:
         return (key for key, _ in self._iteritems())
@@ -74,19 +77,16 @@ class DataIndexView(BaseDataIndex):
                 if key and value:
                     yield key, value
                     if ensure_loaded:
-                        for loaded_key in self._load_dir_keys(
+                        yield from self._load_dir_keys(
                             key, value, shallow=shallow
-                        ):
-                            # pylint: disable-next=protected-access
-                            trie = self._index._trie
-                            yield loaded_key, trie.get(loaded_key)
+                        )
 
     def _load_dir_keys(
         self,
         prefix: DataIndexKey,
         entry: Optional[DataIndexEntry],
         shallow: Optional[bool] = False,
-    ) -> Iterator[DataIndexKey]:
+    ) -> Iterator[Tuple[DataIndexKey, DataIndexEntry]]:
         # NOTE: traverse() will not enter subtries that have been added
         # in-place during traversal. So for dirs which we load in-place, we
         # need to iterate over the new keys ourselves.
@@ -100,8 +100,11 @@ class DataIndexView(BaseDataIndex):
                 prefix, entry
             )
             if not shallow:
-                for key, _ in cast(Tree, entry.obj).iteritems():
-                    yield prefix + key
+                yield from (
+                    (key, val)
+                    for key, val in self._index.iteritems(entry.key)
+                    if key != prefix
+                )
 
     def iteritems(
         self,
@@ -121,26 +124,23 @@ class DataIndexView(BaseDataIndex):
         return self._index.traverse(_node_factory, **kwargs)
 
     def ls(self, root_key: DataIndexKey, detail=True):
-        def node_factory(_, key, children, entry=None):
-            if key == root_key:
-                return children
-
-            if detail:
-                return key, self._info_from_entry(key, entry)
-
-            return key
-
         self._index._ensure_loaded(  # pylint: disable=protected-access
             root_key
         )
-        yield from (
-            entry
-            for entry in self.traverse(node_factory, prefix=root_key)
-            if entry is not None
-        )
+
+        def _filter_fn(entry):
+            key = entry[0] if detail else entry
+            return self.filter_fn(key)
+
+        yield from filter(_filter_fn, self._index.ls(root_key, detail=detail))
 
     def has_node(self, key: DataIndexKey) -> bool:
         return self.filter_fn(key) and self._index.has_node(key)
+
+    def delete_node(self, key: DataIndexKey) -> None:
+        if not self.filter_fn(key):
+            raise KeyError
+        self._index.delete_node(key)
 
     def longest_prefix(
         self, key: DataIndexKey

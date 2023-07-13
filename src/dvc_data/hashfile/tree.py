@@ -1,16 +1,18 @@
 import json
 import logging
 import posixpath
-from typing import TYPE_CHECKING, Dict, Final, Iterable, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Final, Iterable, Optional, Tuple
 
 from dvc_objects.errors import ObjectFormatError
 from funcy import cached_property
 
-from ..hashfile.hash import hash_file
+from ..hashfile.hash import DEFAULT_ALGORITHM, hash_file
 from ..hashfile.meta import Meta
 from ..hashfile.obj import HashFile
 
 if TYPE_CHECKING:
+    from pygtrie import Trie
+
     from ..hashfile.db import HashFileDB
     from ..hashfile.hash_info import HashInfo
 
@@ -50,37 +52,44 @@ class Tree(HashFile):
         self.hash_info = None
         self.oid = None
         self._dict: Dict[
-            Tuple[str, ...], Tuple[Optional["Meta"], "HashInfo"]
+            Tuple[str, ...], Tuple[Optional["Meta"], Optional["HashInfo"]]
         ] = {}
 
     @cached_property
-    def _trie(self):
+    def _trie(self) -> "Trie":
         from pygtrie import Trie
 
         return Trie(self._dict)
 
     def add(
-        self, key: Tuple[str, ...], meta: Optional["Meta"], oid: "HashInfo"
+        self,
+        key: Tuple[str, ...],
+        meta: Optional["Meta"],
+        oid: Optional["HashInfo"],
     ):
         self.__dict__.pop("_trie", None)
         self._dict[key] = (meta, oid)
 
     def get(
         self, key: Tuple[str, ...], default=None
-    ) -> Optional[Tuple[Optional["Meta"], "HashInfo"]]:
+    ) -> Optional[Tuple[Optional["Meta"], Optional["HashInfo"]]]:
         return self._dict.get(key, default)
 
-    def digest(self):
+    def digest(self, with_meta: bool = False, name: str = DEFAULT_ALGORITHM):
         from dvc_objects.fs import MemoryFileSystem
         from dvc_objects.fs.utils import tmp_fname
 
         memfs = MemoryFileSystem()
         path = "memory://{}".format(tmp_fname(""))
         memfs.pipe_file(path, self.as_bytes())
-        self.fs = memfs
-        self.path = path
-        _, self.hash_info = hash_file(path, memfs, "md5")
+        _, self.hash_info = hash_file(path, memfs, name)
         assert self.hash_info.value
+        self.fs = memfs
+        if with_meta:
+            self.path = path + ".with_meta"
+            memfs.pipe_file(self.path, self.as_bytes(with_meta=True))
+        else:
+            self.path = path
         self.hash_info.value += ".dir"
         self.oid = self.hash_info.value
 
@@ -122,12 +131,19 @@ class Tree(HashFile):
     def as_list(self, with_meta: bool = False):
         from operator import itemgetter
 
+        def _hi_to_dict(hi: Optional["HashInfo"]) -> Dict[str, Any]:
+            if not hi:
+                return {}
+            if hi.name == "md5-dos2unix":
+                return {"md5": hi.value}
+            return hi.to_dict()
+
         # Sorting the list by path to ensure reproducibility
         return sorted(
             (
                 {
                     **(meta.to_dict() if with_meta else {}),
-                    **hi.to_dict(),
+                    **_hi_to_dict(hi),
                     self.PARAM_RELPATH: posixpath.sep.join(parts),
                 }
                 for parts, meta, hi in self  # noqa: B301
@@ -135,8 +151,13 @@ class Tree(HashFile):
             key=itemgetter(self.PARAM_RELPATH),
         )
 
-    def as_bytes(self):
-        return json.dumps(self.as_list(), sort_keys=True).encode("utf-8")
+    def as_trie(self) -> "Trie":
+        return self._trie.copy()
+
+    def as_bytes(self, with_meta: bool = False):
+        return json.dumps(
+            self.as_list(with_meta=with_meta), sort_keys=True
+        ).encode("utf-8")
 
     @classmethod
     def from_list(cls, lst, hash_name: Optional[str] = None):
@@ -149,14 +170,21 @@ class Tree(HashFile):
             parts = tuple(relpath.split(posixpath.sep))
             meta = Meta.from_dict(entry)
             if hash_name:
-                hash_info = HashInfo(hash_name, getattr(meta, hash_name))
+                meta_name = "md5" if hash_name == "md5-dos2unix" else hash_name
+                hash_info = HashInfo(hash_name, getattr(meta, meta_name))
             else:
                 hash_info = HashInfo.from_dict(entry)
             tree.add(parts, meta, hash_info)
         return tree
 
     @classmethod
-    def load(cls, odb, hash_info) -> "Tree":
+    def from_trie(cls, trie: "Trie") -> "Tree":
+        tree = cls()
+        tree._dict = dict(trie.iteritems())
+        return tree
+
+    @classmethod
+    def load(cls, odb, hash_info, hash_name: Optional[str] = None) -> "Tree":
         obj = odb.get(hash_info.value)
 
         try:
@@ -172,7 +200,9 @@ class Tree(HashFile):
             )
             raise ObjectFormatError(f"{obj} is corrupted")
 
-        tree = cls.from_list(raw)
+        if hash_name is None and odb.hash_name == "md5-dos2unix":
+            hash_name = "md5-dos2unix"
+        tree = cls.from_list(raw, hash_name=hash_name)
         tree.path = obj.path
         tree.fs = obj.fs
         tree.hash_info = hash_info

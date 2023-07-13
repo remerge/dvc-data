@@ -18,6 +18,7 @@ def test_diff():
     old_foo_key = ("foo",)
     old_foo_entry = DataIndexEntry(
         key=old_foo_key,
+        meta=Meta(),
         hash_info=HashInfo(
             name="md5", value="d3b07384d113edec49eaa6238ad5ff00"
         ),
@@ -25,6 +26,7 @@ def test_diff():
     old_bar_key = ("dir", "subdir", "bar")
     old_bar_entry = DataIndexEntry(
         key=old_bar_key,
+        meta=Meta(isdir=True),
         hash_info=HashInfo(
             name="md5",
             value="1f69c66028c35037e8bf67e5bc4ceb6a.dir",
@@ -44,6 +46,7 @@ def test_diff():
     new_foo_key = ("data", "FOO")
     new_foo_entry = DataIndexEntry(
         key=new_foo_key,
+        meta=Meta(),
         hash_info=HashInfo(
             name="md5", value="d3b07384d113edec49eaa6238ad5ff00"
         ),
@@ -102,17 +105,6 @@ def test_diff_meta_only():
         Change(MODIFY, old_entry, new_entry),
     ]
 
-    new_entry.meta = None
-    assert list(diff(old, new, meta_only=True, with_unchanged=True)) == [
-        Change(DELETE, old_entry, new_entry),
-    ]
-
-    old_entry.meta = None
-    new_entry.meta = Meta(etag="abc")
-    assert list(diff(old, new, meta_only=True, with_unchanged=True)) == [
-        Change(ADD, old_entry, new_entry),
-    ]
-
 
 @pytest.mark.parametrize(
     "typ, left_meta, left_hi, right_meta, right_hi",
@@ -155,17 +147,22 @@ def test_diff_combined(typ, left_meta, left_hi, right_meta, right_hi):
     old = DataIndex({key: old_entry})
     new = DataIndex({key: new_entry})
 
-    # diff should return UNCHANGED/ADD/DELETE only when both meta and hash info
-    # diff match
+    # diff should return UNCHANGED if both meta and hash info match,
+    # but MODIFY if they don't since entries still exist
     assert list(diff(old, new, with_unchanged=True)) == [
-        Change(typ, old_entry, new_entry),
+        Change(
+            UNCHANGED if typ == UNCHANGED else MODIFY, old_entry, new_entry
+        ),
     ]
 
-    # diff should return hash info diff when both meta's are None
+    # diff should return UNCHANGED if both meta and hash info match,
+    # but MODIFY if they don't since entries still exist
     old_entry.meta = None
     new_entry.meta = None
     assert list(diff(old, new, with_unchanged=True)) == [
-        Change(typ, old_entry, new_entry),
+        Change(
+            UNCHANGED if typ == UNCHANGED else MODIFY, old_entry, new_entry
+        ),
     ]
 
     # diff should return meta diff when both hash infos are None
